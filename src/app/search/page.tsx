@@ -1,7 +1,7 @@
 /* eslint-disable react-hooks/exhaustive-deps, @typescript-eslint/no-explicit-any,@typescript-eslint/no-non-null-assertion,no-empty */
 'use client';
 
-import { ChevronUp, RefreshCw, Search, X } from 'lucide-react';
+import { ChevronUp, RefreshCw, Search, X, Film, HardDrive } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import React, { startTransition, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -19,6 +19,7 @@ import SearchResultFilter, { SearchFilterCategory } from '@/components/SearchRes
 import SearchSuggestions from '@/components/SearchSuggestions';
 import VideoCard, { VideoCardHandle } from '@/components/VideoCard';
 import PansouSearch from '@/components/PansouSearch';
+import CapsuleSwitch from '@/components/CapsuleSwitch';
 
 function SearchPageClient() {
   // 搜索历史
@@ -800,27 +801,23 @@ function SearchPageClient() {
           </form>
 
           {/* 选项卡 */}
-          <div className='flex justify-center gap-2 mt-6'>
-            <button
-              onClick={() => setActiveTab('video')}
-              className={`px-6 py-2 rounded-lg text-sm font-medium transition-colors ${
-                activeTab === 'video'
-                  ? 'bg-green-600 text-white dark:bg-green-600'
-                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700'
-              }`}
-            >
-              影视搜索
-            </button>
-            <button
-              onClick={() => setActiveTab('pansou')}
-              className={`px-6 py-2 rounded-lg text-sm font-medium transition-colors ${
-                activeTab === 'pansou'
-                  ? 'bg-green-600 text-white dark:bg-green-600'
-                  : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700'
-              }`}
-            >
-              网盘搜索
-            </button>
+          <div className='flex justify-center mt-6'>
+            <CapsuleSwitch
+              options={[
+                {
+                  label: '影视搜索',
+                  value: 'video',
+                  icon: <Film size={16} />,
+                },
+                {
+                  label: '网盘搜索',
+                  value: 'pansou',
+                  icon: <HardDrive size={16} />,
+                },
+              ]}
+              active={activeTab}
+              onChange={(value) => setActiveTab(value as 'video' | 'pansou')}
+            />
           </div>
         </div>
 
