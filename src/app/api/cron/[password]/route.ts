@@ -2,8 +2,11 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 
+import { checkAnimeSubscriptions } from '@/lib/anime-subscription';
 import { getConfig, refineConfig } from '@/lib/config';
 import { db, getStorage } from '@/lib/db';
+import { EmailService } from '@/lib/email.service';
+import { FavoriteUpdate,getBatchFavoriteUpdateEmailTemplate } from '@/lib/email.templates';
 import { fetchVideoDetail } from '@/lib/fetchVideoDetail';
 import { refreshLiveChannels } from '@/lib/live';
 import { startOpenListRefresh } from '@/lib/openlist-refresh';
@@ -11,18 +14,71 @@ import { SearchResult } from '@/lib/types';
 
 export const runtime = 'nodejs';
 
-export async function GET(request: NextRequest) {
+// 内存中记录最后执行时间（毫秒时间戳）
+let lastExecutionTime = 0;
+const COOLDOWN_MS = 10 * 60 * 1000; // 10分钟冷却时间
+
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { password: string } }
+) {
   console.log(request.url);
+
+  const cronPassword = process.env.CRON_PASSWORD || 'mtvpls';
+  if (params.password !== cronPassword) {
+    return NextResponse.json(
+      { success: false, message: 'Unauthorized' },
+      { status: 401 }
+    );
+  }
+
+  // 检查冷却时间
+  const now = Date.now();
+  const timeSinceLastExecution = now - lastExecutionTime;
+
+  if (lastExecutionTime > 0 && timeSinceLastExecution < COOLDOWN_MS) {
+    const remainingSeconds = Math.ceil((COOLDOWN_MS - timeSinceLastExecution) / 1000);
+    const remainingMinutes = Math.floor(remainingSeconds / 60);
+    const seconds = remainingSeconds % 60;
+
+    console.log(`Cron job skipped: cooldown period active. Remaining: ${remainingMinutes}m ${seconds}s`);
+
+    return NextResponse.json({
+      success: false,
+      message: 'Cron job is in cooldown period',
+      remainingSeconds,
+      nextAvailableTime: new Date(lastExecutionTime + COOLDOWN_MS).toISOString(),
+      timestamp: new Date().toISOString(),
+    }, { status: 429 });
+  }
+
   try {
     console.log('Cron job triggered:', new Date().toISOString());
 
-    cronJob();
+    // 更新最后执行时间
+    lastExecutionTime = now;
 
-    return NextResponse.json({
-      success: true,
-      message: 'Cron job executed successfully',
-      timestamp: new Date().toISOString(),
-    });
+    // 环境变量控制是否等待定时任务完全结束后再返回响应（默认 false）
+    // 用于防止 Vercel 等平台杀后台进程
+    const waitForCompletion = process.env.CRON_WAIT_FOR_COMPLETION === 'true';
+
+    if (waitForCompletion) {
+      // 等待定时任务完成后再返回 200
+      await cronJob();
+      return NextResponse.json({
+        success: true,
+        message: 'Cron job executed successfully',
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      // 立即返回 202，定时任务在后台执行
+      cronJob();
+      return NextResponse.json({
+        success: true,
+        message: 'Cron job accepted and running in background',
+        timestamp: new Date().toISOString(),
+      }, { status: 202 });
+    }
   } catch (error) {
     console.error('Cron job failed:', error);
 
@@ -39,10 +95,16 @@ export async function GET(request: NextRequest) {
 }
 
 async function cronJob() {
+  // 先刷新配置，确保其他任务使用最新配置
   await refreshConfig();
-  await refreshAllLiveChannels();
-  await refreshOpenList();
-  await refreshRecordAndFavorites();
+
+  // 其余任务并行执行
+  await Promise.all([
+    refreshAllLiveChannels(),
+    refreshOpenList(),
+    refreshRecordAndFavorites(),
+    checkAnimeSubscriptions(),
+  ]);
 }
 
 async function refreshAllLiveChannels() {
@@ -123,6 +185,19 @@ async function refreshRecordAndFavorites() {
     if (process.env.USERNAME && !users.includes(process.env.USERNAME)) {
       users.push(process.env.USERNAME);
     }
+
+    // 环境变量控制是否跳过特定源（默认为 false，即默认跳过）
+    const includeSpecialSources = process.env.CRON_INCLUDE_SPECIAL_SOURCES === 'true';
+
+    // 检查是否应该跳过该源
+    const shouldSkipSource = (source: string): boolean => {
+      if (includeSpecialSources) {
+        return false; // 如果开启了包含特殊源，则不跳过任何源
+      }
+      // 默认跳过 emby 开头、openlist、xiaoya 和 live 开头的源
+      return source.startsWith('emby') || source === 'openlist' || source === 'xiaoya' || source.startsWith('live');
+    };
+
     // 函数级缓存：key 为 `${source}+${id}`，值为 Promise<VideoDetail | null>
     const detailCache = new Map<string, Promise<SearchResult | null>>();
 
@@ -135,26 +210,28 @@ async function refreshRecordAndFavorites() {
       const key = `${source}+${id}`;
       let promise = detailCache.get(key);
       if (!promise) {
+        // 立即缓存Promise，避免并发时的竞态条件
         promise = fetchVideoDetail({
           source,
           id,
           fallbackTitle: fallbackTitle.trim(),
         })
           .then((detail) => {
-            // 成功时才缓存结果
-            const successPromise = Promise.resolve(detail);
-            detailCache.set(key, successPromise);
             return detail;
           })
           .catch((err) => {
             console.error(`获取视频详情失败 (${source}+${id}):`, err);
+            // 失败时从缓存中移除，下次可以重试
+            detailCache.delete(key);
             return null;
           });
+        detailCache.set(key, promise);
       }
       return promise;
     };
 
-    for (const user of users) {
+    // 处理单个用户的函数
+    const processUser = async (user: string) => {
       console.log(`开始处理用户: ${user}`);
       const storage = getStorage();
 
@@ -172,6 +249,13 @@ async function refreshRecordAndFavorites() {
               continue;
             }
 
+            // 检查是否应该跳过该源
+            if (shouldSkipSource(source)) {
+              console.log(`跳过播放记录 (源被过滤): ${key}`);
+              processedRecords++;
+              continue;
+            }
+
             const detail = await getDetail(source, id, record.title);
             if (!detail) {
               console.warn(`跳过无法获取详情的播放记录: ${key}`);
@@ -180,6 +264,14 @@ async function refreshRecordAndFavorites() {
 
             const episodeCount = detail.episodes?.length || 0;
             if (episodeCount > 0 && episodeCount !== record.total_episodes) {
+              // 计算新增的剧集数量
+              const newEpisodesCount = episodeCount > record.total_episodes
+                ? episodeCount - record.total_episodes
+                : 0;
+
+              // 如果有新增剧集，累加到现有的 new_episodes 字段
+              const updatedNewEpisodes = (record.new_episodes || 0) + newEpisodesCount;
+
               await db.savePlayRecord(user, source, id, {
                 title: detail.title || record.title,
                 source_name: record.source_name,
@@ -191,9 +283,10 @@ async function refreshRecordAndFavorites() {
                 total_time: record.total_time,
                 save_time: record.save_time,
                 search_title: record.search_title,
+                new_episodes: updatedNewEpisodes > 0 ? updatedNewEpisodes : undefined,
               });
               console.log(
-                `更新播放记录: ${record.title} (${record.total_episodes} -> ${episodeCount})`
+                `更新播放记录: ${record.title} (${record.total_episodes} -> ${episodeCount}, 新增 ${newEpisodesCount} 集)`
               );
             }
 
@@ -218,12 +311,20 @@ async function refreshRecordAndFavorites() {
         const totalFavorites = Object.keys(favorites).length;
         let processedFavorites = 0;
         const now = Date.now();
+        const userUpdates: FavoriteUpdate[] = []; // 收集该用户的所有更新
 
         for (const [key, fav] of Object.entries(favorites)) {
           try {
             const [source, id] = key.split('+');
             if (!source || !id) {
               console.warn(`跳过无效的收藏键: ${key}`);
+              continue;
+            }
+
+            // 检查是否应该跳过该源
+            if (shouldSkipSource(source)) {
+              console.log(`跳过收藏 (源被过滤): ${key}`);
+              processedFavorites++;
               continue;
             }
 
@@ -267,6 +368,17 @@ async function refreshRecordAndFavorites() {
 
               await storage.addNotification(user, notification);
               console.log(`已为用户 ${user} 创建收藏更新通知: ${fav.title}`);
+
+              // 收集更新信息用于邮件
+              const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
+              const playUrl = `${siteUrl}/play?source=${source}&id=${id}&title=${encodeURIComponent(fav.title)}`;
+              userUpdates.push({
+                title: fav.title,
+                oldEpisodes: fav.total_episodes,
+                newEpisodes: favEpisodeCount,
+                url: playUrl,
+                cover: favDetail.poster || fav.cover,
+              });
             }
 
             processedFavorites++;
@@ -277,9 +389,55 @@ async function refreshRecordAndFavorites() {
         }
 
         console.log(`收藏处理完成: ${processedFavorites}/${totalFavorites}`);
+
+        // 如果有更新，异步发送汇总邮件（不阻塞主流程）
+        if (userUpdates.length > 0) {
+          (async () => {
+            try {
+              const userEmail = storage.getUserEmail ? await storage.getUserEmail(user) : null;
+              const emailNotifications = storage.getEmailNotificationPreference
+                ? await storage.getEmailNotificationPreference(user)
+                : false;
+
+              if (userEmail && emailNotifications) {
+                const config = await getConfig();
+                const emailConfig = config?.EmailConfig;
+
+                if (emailConfig?.enabled) {
+                  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000';
+                  const siteName = config?.SiteConfig?.SiteName || 'MoonTVPlus';
+
+                  await EmailService.send(emailConfig, {
+                    to: userEmail,
+                    subject: `📺 收藏更新汇总 - ${userUpdates.length} 部影片有更新`,
+                    html: getBatchFavoriteUpdateEmailTemplate(
+                      user,
+                      userUpdates,
+                      siteUrl,
+                      siteName
+                    ),
+                  });
+
+                  console.log(`邮件汇总已发送至: ${userEmail} (${userUpdates.length} 个更新)`);
+                }
+              }
+            } catch (emailError) {
+              console.error(`发送邮件汇总失败 (${user}):`, emailError);
+            }
+          })().catch(err => console.error(`邮件发送异步任务失败 (${user}):`, err));
+        }
       } catch (err) {
         console.error(`获取用户收藏失败 (${user}):`, err);
       }
+    };
+
+    // 分批并行处理用户，避免并发过高
+    // 可通过环境变量 CRON_USER_BATCH_SIZE 配置批处理大小，默认为 3
+    const BATCH_SIZE = parseInt(process.env.CRON_USER_BATCH_SIZE || '3', 10);
+    for (let i = 0; i < users.length; i += BATCH_SIZE) {
+      const batch = users.slice(i, i + BATCH_SIZE);
+      console.log(`处理用户批次 ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(users.length / BATCH_SIZE)}: ${batch.join(', ')}`);
+      await Promise.all(batch.map(user => processUser(user)));
     }
 
     console.log('刷新播放记录/收藏任务完成');

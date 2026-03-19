@@ -5,7 +5,6 @@
  */
 
 import { fetchDoubanData as fetchDoubanAPI } from '@/lib/douban';
-import { searchTMDB, getTVSeasons } from '@/lib/tmdb.search';
 import { getNextApiKey } from '@/lib/tmdb.client';
 
 export interface VideoContext {
@@ -249,7 +248,8 @@ async function fetchTMDBData(
     type?: 'movie' | 'tv';
   },
   tmdbApiKey?: string,
-  tmdbProxy?: string
+  tmdbProxy?: string,
+  tmdbReverseProxy?: string
 ): Promise<any> {
   try {
     const actualKey = getNextApiKey(tmdbApiKey || '');
@@ -263,9 +263,11 @@ async function fetchTMDBData(
       return null;
     }
 
+    // 使用反代代理或默认 Base URL
+    const baseUrl = tmdbReverseProxy || 'https://api.themoviedb.org';
     // 使用 TMDB API 获取详情
     // TMDB API: https://api.themoviedb.org/3/{type}/{id}
-    const url = `https://api.themoviedb.org/3/${params.type}/${params.id}?api_key=${actualKey}&language=zh-CN&append_to_response=keywords,similar`;
+    const url = `${baseUrl}/3/${params.type}/${params.id}?api_key=${actualKey}&language=zh-CN&append_to_response=keywords,similar`;
 
     console.log('📡 获取TMDB详情:', params.type, params.id);
 
@@ -344,14 +346,19 @@ function formatSearchResults(
  * 清理可能被代码块包裹的JSON字符串
  */
 function cleanJsonResponse(content: string): string {
-  // 去除可能的markdown代码块标记
   let cleaned = content.trim();
 
-  // 移除 ```json 或 ``` 开头
-  cleaned = cleaned.replace(/^```(?:json)?\s*\n?/i, '');
-
-  // 移除 ``` 结尾
-  cleaned = cleaned.replace(/\n?```\s*$/, '');
+  // 尝试提取代码块中的内容（支持前面有说明文字的情况）
+  const codeBlockMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/i);
+  if (codeBlockMatch) {
+    cleaned = codeBlockMatch[1].trim();
+  } else {
+    // 如果没有代码块，尝试提取第一个 { 到最后一个 } 之间的内容
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      cleaned = jsonMatch[0];
+    }
+  }
 
   return cleaned.trim();
 }
@@ -517,6 +524,7 @@ export async function orchestrateDataSources(
     // TMDB 配置
     tmdbApiKey?: string;
     tmdbProxy?: string;
+    tmdbReverseProxy?: string;
     // 决策模型配置
     enableDecisionModel?: boolean;
     decisionProvider?: 'openai' | 'claude' | 'custom';
@@ -653,7 +661,8 @@ export async function orchestrateDataSources(
         type: context.type,
       },
       config?.tmdbApiKey,
-      config?.tmdbProxy
+      config?.tmdbProxy,
+      config?.tmdbReverseProxy
     );
     dataPromises.push(tmdbPromise);
   }
@@ -686,7 +695,14 @@ export async function orchestrateDataSources(
   }
 
   // 4. 构建系统提示词
+  // 获取UTC+8时区的日期
+  const now = new Date();
+  const utc8Date = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  const today = utc8Date.toISOString().split('T')[0]; // YYYY-MM-DD格式
   let systemPrompt = `你是 MoonTVPlus 的 AI 影视助手，专门帮助用户发现和了解影视内容。
+
+## 当前日期
+${today}
 
 ## 你的能力
 - 提供影视推荐（基于豆瓣热门榜单和TMDB数据）

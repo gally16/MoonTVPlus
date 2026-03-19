@@ -30,9 +30,27 @@ export async function GET(
 
   // 验证 TVBox Token（从路径中获取）
   const requestToken = params.token;
-  const subscribeToken = process.env.TVBOX_SUBSCRIBE_TOKEN;
+  const globalToken = process.env.TVBOX_SUBSCRIBE_TOKEN;
 
-  if (!subscribeToken || requestToken !== subscribeToken) {
+  // 检查是否是全局token或用户token
+  let isValidToken = false;
+  if (globalToken && requestToken === globalToken) {
+    // 全局token
+    isValidToken = true;
+  } else {
+    // 检查是否是用户token
+    const { db } = await import('@/lib/db');
+    const username = await db.getUsernameByTvboxToken(requestToken);
+    if (username) {
+      // 检查用户是否被封禁
+      const userInfo = await db.getUserInfoV2(username);
+      if (userInfo && !userInfo.banned) {
+        isValidToken = true;
+      }
+    }
+  }
+
+  if (!isValidToken) {
     return NextResponse.json(
       {
         code: 401,
@@ -76,7 +94,7 @@ export async function GET(
     const { getCachedMetaInfo, setCachedMetaInfo } = await import('@/lib/openlist-cache');
     const { db } = await import('@/lib/db');
 
-    let metaInfo = getCachedMetaInfo(rootPath);
+    let metaInfo = getCachedMetaInfo();
 
     if (!metaInfo) {
       try {
@@ -84,7 +102,7 @@ export async function GET(
         if (metainfoJson) {
           metaInfo = JSON.parse(metainfoJson);
           if (metaInfo) {
-            setCachedMetaInfo(rootPath, metaInfo);
+            setCachedMetaInfo(metaInfo);
           }
         }
       } catch (error) {
@@ -267,22 +285,39 @@ async function handleDetail(
 
   let videoInfo = getCachedVideoInfo(folderPath);
 
-  const listResponse = await client.listDirectory(folderPath);
+  // 获取所有分页的视频文件
+  const allFiles: any[] = [];
+  let currentPage = 1;
+  const pageSize = 100;
+  let total = 0;
 
-  if (listResponse.code !== 200) {
-    return NextResponse.json({
-      code: 0,
-      msg: 'OpenList 列表获取失败',
-      page: 1,
-      pagecount: 0,
-      limit: 0,
-      total: 0,
-      list: [],
-    });
+  while (true) {
+    const listResponse = await client.listDirectory(folderPath, currentPage, pageSize);
+
+    if (listResponse.code !== 200) {
+      return NextResponse.json({
+        code: 0,
+        msg: 'OpenList 列表获取失败2',
+        page: 1,
+        pagecount: 0,
+        limit: 0,
+        total: 0,
+        list: [],
+      });
+    }
+
+    total = listResponse.data.total;
+    allFiles.push(...listResponse.data.content);
+
+    if (allFiles.length >= total) {
+      break;
+    }
+
+    currentPage++;
   }
 
   const videoExtensions = ['.mp4', '.mkv', '.avi', '.m3u8', '.flv', '.ts', '.mov', '.wmv', '.webm', '.rmvb', '.rm', '.mpg', '.mpeg', '.3gp', '.f4v', '.m4v', '.vob'];
-  const videoFiles = listResponse.data.content.filter((item) => {
+  const videoFiles = allFiles.filter((item) => {
     if (item.is_dir || item.name.startsWith('.') || item.name.endsWith('.json')) return false;
     return videoExtensions.some(ext => item.name.toLowerCase().endsWith(ext));
   });
@@ -298,6 +333,7 @@ async function handleDetail(
         season: parsed.season,
         title: parsed.title,
         parsed_from: 'filename',
+        isOVA: parsed.isOVA,
       };
     }
     setCachedVideoInfo(folderPath, videoInfo);
@@ -315,13 +351,13 @@ async function handleDetail(
       const parsed = parseVideoFileName(file.name);
       let episodeInfo;
       if (parsed.episode) {
-        episodeInfo = { episode: parsed.episode, season: parsed.season, title: parsed.title, parsed_from: 'filename' };
+        episodeInfo = { episode: parsed.episode, season: parsed.season, title: parsed.title, parsed_from: 'filename', isOVA: parsed.isOVA };
       } else {
         episodeInfo = videoInfo!.episodes[file.name] || { episode: index + 1, season: undefined, title: undefined, parsed_from: 'filename' };
       }
       let displayTitle = episodeInfo.title;
       if (!displayTitle && episodeInfo.episode) {
-        displayTitle = `第${episodeInfo.episode}集`;
+        displayTitle = episodeInfo.isOVA ? `OVA ${episodeInfo.episode}` : `第${episodeInfo.episode}集`;
       }
       if (!displayTitle) {
         displayTitle = file.name;
@@ -336,9 +372,16 @@ async function handleDetail(
         season: episodeInfo.season,
         title: displayTitle,
         playUrl,
+        isOVA: episodeInfo.isOVA,
       };
     })
-    .sort((a, b) => a.episode !== b.episode ? a.episode - b.episode : a.fileName.localeCompare(b.fileName));
+    .sort((a, b) => {
+      // OVA 排在最后
+      if (a.isOVA && !b.isOVA) return 1;
+      if (!a.isOVA && b.isOVA) return -1;
+      // 都是 OVA 或都不是 OVA，按集数排序
+      return a.episode !== b.episode ? a.episode - b.episode : a.fileName.localeCompare(b.fileName);
+    });
 
   // 转换为 CMS vod_play_url 格式
   // 格式：第1集$url1#第2集$url2#第3集$url3
